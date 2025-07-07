@@ -1,0 +1,287 @@
+import sounddevice as sd
+import numpy as np
+import webrtcvad
+import whisper
+from deep_translator import GoogleTranslator
+import queue
+import threading
+import time
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+from tkinter import scrolledtext, messagebox
+
+# Default configuration
+SAMPLE_RATE = 16000
+FRAME_DURATION = 30  # ms
+FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION / 1000)
+CHANNELS = 1
+VAD_MODE = 2
+MAX_SEGMENT_DURATION = 30  # seconds
+MODEL_SIZE = "small"
+SOURCE_LANG = "ru"
+TARGET_LANG = "en"
+DEVICE_INDEX = None
+
+# Initialize tools
+vad = webrtcvad.Vad(VAD_MODE)
+model = whisper.load_model(MODEL_SIZE)
+translator = GoogleTranslator(source=SOURCE_LANG, target=TARGET_LANG)
+
+# Queues and flags
+audio_q = queue.Queue()
+text_queue = queue.Queue()
+running_flag = threading.Event()
+
+# Stats
+stats = {
+    "segments": 0,
+    "last_duration": 0,
+    "last_length": 0,
+    "last_volume": 0.0,
+}
+
+def list_devices():
+    return [(i, d['name']) for i, d in enumerate(sd.query_devices()) if d['max_input_channels'] > 0]
+
+def frame_generator(stream):
+    while running_flag.is_set():
+        data, _ = stream.read(FRAME_SIZE)
+        yield data[:, 0].copy()
+
+def is_speech(frame):
+    pcm = (frame * 32768).astype(np.int16).tobytes()
+    return vad.is_speech(pcm, SAMPLE_RATE)
+
+def record_segments(progress_callback=None, reset_callback=None):
+    global DEVICE_INDEX
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='float32',
+                        blocksize=FRAME_SIZE, device=DEVICE_INDEX) as stream:
+        frames = []
+        speech_started = False
+        silence_count = 0
+        max_frames = int(MAX_SEGMENT_DURATION * 1000 / FRAME_DURATION)
+        start_time = time.time()
+
+        for i, frame in enumerate(frame_generator(stream)):
+            if not running_flag.is_set():
+                break
+
+            if is_speech(frame):
+                frames.append(frame)
+                speech_started = True
+                silence_count = 0
+            elif speech_started:
+                silence_count += 1
+                frames.append(frame)
+                if silence_count > 10:
+                    break
+
+            elapsed = time.time() - start_time
+            if progress_callback:
+                progress_callback(min(elapsed, MAX_SEGMENT_DURATION), MAX_SEGMENT_DURATION)
+
+            if len(frames) > max_frames:
+                break
+
+        if frames:
+            duration = time.time() - start_time
+            volume = np.mean(np.abs(np.concatenate(frames)))
+            stats["last_volume"] = volume
+            stats["last_duration"] = round(duration, 2)
+
+            audio = np.concatenate(frames)
+            audio_q.put(audio)
+
+    if reset_callback:
+        reset_callback()
+
+def transcribe_translate():
+    while running_flag.is_set():
+        try:
+            audio = audio_q.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            result = model.transcribe(audio, language=SOURCE_LANG, task='transcribe', fp16=False)
+            ru = result['text'].strip()
+            if ru:
+                en = translator.translate(ru)
+                stats["segments"] += 1
+                stats["last_length"] = len(ru)
+                text_queue.put((ru, en))
+        except Exception as e:
+            text_queue.put((f"[Error] {str(e)}", ""))
+
+def build_gui():
+    global DEVICE_INDEX, vad, model, translator, MODEL_SIZE, VAD_MODE, MAX_SEGMENT_DURATION, SOURCE_LANG, TARGET_LANG
+
+    app = tb.Window(themename="darkly")
+    app.title("🎙️ Live Russian-English Translator")
+    app.geometry("1100x800")
+
+    # Device selector
+    device_frame = tb.Frame(app)
+    device_frame.pack(pady=5)
+    tb.Label(device_frame, text="🎧 Input Device:").pack(side=LEFT, padx=(0, 5))
+    device_list = list_devices()
+    device_var = tb.StringVar()
+    device_combo = tb.Combobox(device_frame, values=[f"{i}: {name}" for i, name in device_list],
+                               textvariable=device_var, width=60)
+    device_combo.pack(side=LEFT)
+
+    # Status + progress
+    status_var = tb.StringVar(value="🟢 Idle")
+    status_label = tb.Label(app, textvariable=status_var, bootstyle=INFO, font=("Helvetica", 12))
+    status_label.pack(pady=(5, 0))
+
+    progress = tb.Progressbar(app, length=400, mode="determinate")
+    progress.pack(pady=5)
+
+    # Text output
+    text_frame = tb.Frame(app)
+    text_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+    ru_box = scrolledtext.ScrolledText(text_frame, height=12, width=70, font=("Consolas", 10))
+    ru_box.pack(side=LEFT, expand=True, fill=BOTH, padx=(0, 5))
+    ru_box.insert('end', "🇷🇺 Source Language\n")
+    ru_box.config(state='disabled')
+
+    en_box = scrolledtext.ScrolledText(text_frame, height=12, width=70, font=("Consolas", 10))
+    en_box.pack(side=LEFT, expand=True, fill=BOTH)
+    en_box.insert('end', "🌍 Translated Language\n")
+    en_box.config(state='disabled')
+
+    # Stats
+    stats_frame = tb.Labelframe(app, text="📊 Translation Stats")
+    stats_frame.pack(fill=X, padx=10, pady=(0, 10))
+    seg_label = tb.Label(stats_frame, text="Total Segments: 0", font=("Consolas", 10))
+    dur_label = tb.Label(stats_frame, text="Last Duration: 0.0 sec", font=("Consolas", 10))
+    len_label = tb.Label(stats_frame, text="Last Transcript Length: 0 chars", font=("Consolas", 10))
+    vol_label = tb.Label(stats_frame, text="Estimated Clarity: Good", font=("Consolas", 10))
+    seg_label.pack(anchor=W)
+    dur_label.pack(anchor=W)
+    len_label.pack(anchor=W)
+    vol_label.pack(anchor=W)
+
+    # Listening animation
+    listening_animation_running = [False]
+    def animate_listening():
+        if not listening_animation_running[0]:
+            return
+        current = status_var.get()
+        if "Listening" in current:
+            dots = (current.count(".") % 3) + 1
+            status_var.set("🎤 Listening" + "." * dots)
+        app.after(500, animate_listening)
+
+    # Buttons
+    button_frame = tb.Frame(app)
+    button_frame.pack(pady=10)
+
+    def update_progress(elapsed, total):
+        percent = int((elapsed / total) * 100)
+        progress["value"] = percent
+
+    def reset_progress():
+        progress["value"] = 0
+
+    def record_loop():
+        while running_flag.is_set():
+            record_segments(progress_callback=update_progress, reset_callback=reset_progress)
+
+    def start():
+        global DEVICE_INDEX
+        if not device_var.get():
+            status_var.set("❌ Please select a device")
+            return
+        DEVICE_INDEX = int(device_var.get().split(":")[0])
+        running_flag.set()
+        status_var.set("🎤 Listening.")
+        listening_animation_running[0] = True
+        animate_listening()
+        threading.Thread(target=transcribe_translate, daemon=True).start()
+        threading.Thread(target=record_loop, daemon=True).start()
+
+    def stop():
+        running_flag.clear()
+        listening_animation_running[0] = False
+        reset_progress()
+        status_var.set("⏹️ Stopped")
+
+    tb.Button(button_frame, text="▶ Start", command=start, bootstyle=SUCCESS).pack(side=LEFT, padx=10)
+    tb.Button(button_frame, text="⏹ Stop", command=stop, bootstyle=DANGER).pack(side=LEFT, padx=10)
+
+    # Settings panel
+    settings_frame = tb.Labelframe(app, text="⚙️ Settings")
+    settings_frame.pack(fill=X, padx=10, pady=(0, 10))
+
+    # Whisper model
+    tb.Label(settings_frame, text="Model:").grid(row=0, column=0, padx=5, pady=2)
+    model_var = tb.StringVar(value=MODEL_SIZE)
+    model_entry = tb.Combobox(settings_frame, textvariable=model_var, values=["tiny", "base", "small", "medium", "large"])
+    model_entry.grid(row=0, column=1, padx=5, pady=2)
+
+    # VAD
+    tb.Label(settings_frame, text="VAD Sensitivity (0–3):").grid(row=0, column=2, padx=5, pady=2)
+    vad_var = tb.IntVar(value=VAD_MODE)
+    tb.Entry(settings_frame, textvariable=vad_var, width=5).grid(row=0, column=3, padx=5, pady=2)
+
+    # Max segment duration
+    tb.Label(settings_frame, text="Max Segment Duration (s):").grid(row=0, column=4, padx=5, pady=2)
+    dur_var = tb.IntVar(value=MAX_SEGMENT_DURATION)
+    tb.Entry(settings_frame, textvariable=dur_var, width=5).grid(row=0, column=5, padx=5, pady=2)
+
+    # Source/target language
+    tb.Label(settings_frame, text="Source Lang:").grid(row=1, column=0, padx=5, pady=2)
+    src_var = tb.StringVar(value=SOURCE_LANG)
+    tb.Entry(settings_frame, textvariable=src_var, width=10).grid(row=1, column=1, padx=5, pady=2)
+
+    tb.Label(settings_frame, text="Target Lang:").grid(row=1, column=2, padx=5, pady=2)
+    tgt_var = tb.StringVar(value=TARGET_LANG)
+    tb.Entry(settings_frame, textvariable=tgt_var, width=10).grid(row=1, column=3, padx=5, pady=2)
+
+    def apply_settings():
+        global vad, model, translator, MODEL_SIZE, VAD_MODE, MAX_SEGMENT_DURATION, SOURCE_LANG, TARGET_LANG
+        try:
+            MODEL_SIZE = model_var.get()
+            VAD_MODE = int(vad_var.get())
+            MAX_SEGMENT_DURATION = int(dur_var.get())
+            SOURCE_LANG = src_var.get()
+            TARGET_LANG = tgt_var.get()
+            FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION / 1000)
+            vad = webrtcvad.Vad(VAD_MODE)
+            model = whisper.load_model(MODEL_SIZE)
+            translator = GoogleTranslator(source=SOURCE_LANG, target=TARGET_LANG)
+            messagebox.showinfo("Settings", "Settings updated successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    tb.Button(settings_frame, text="💾 Apply", command=apply_settings).grid(row=1, column=5, padx=5, pady=2)
+
+    # Update loop
+    def update_gui():
+        while not text_queue.empty():
+            ru, en = text_queue.get_nowait()
+            ru_box.config(state='normal')
+            en_box.config(state='normal')
+            ru_box.insert('end', ru + "\n")
+            en_box.insert('end', en + "\n")
+            ru_box.see('end')
+            en_box.see('end')
+            ru_box.config(state='disabled')
+            en_box.config(state='disabled')
+
+        seg_label.config(text=f"Total Segments: {stats['segments']}")
+        dur_label.config(text=f"Last Duration: {stats['last_duration']} sec")
+        len_label.config(text=f"Last Transcript Length: {stats['last_length']} chars")
+
+        clarity = "Poor" if stats['last_volume'] < 0.01 else "Good" if stats['last_volume'] > 0.03 else "Fair"
+        vol_label.config(text=f"Estimated Clarity: {clarity}")
+
+        app.after(500, update_gui)
+
+    update_gui()
+    app.mainloop()
+
+if __name__ == "__main__":
+    build_gui()
